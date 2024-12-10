@@ -1,0 +1,738 @@
+---
+title: 'Predicting International Monthly Passenger Count with SFO Passenger Data'
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+  pdf_document:
+    toc: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+The purpose of this project is to build a regression model to accurately predict monthly passenger count from passenger data provided by Data SF, ran by the San Francisco government [https://data.sfgov.org/Transportation/Air-Traffic-Passenger-Statistics/rkru-6vcg]. 
+
+Building a regression model to predict monthly passenger count for a major international airport is important for various reasons. Firstly, accurate predictions of passenger count enable airport authorities to efficiently plan and manage their resources. This includes staffing levels, security measures, infrastructure capacity, and flight scheduling. By understanding the expected passenger volume, airports can optimize their operations, improve service quality, and enhance the overall passenger experience.
+
+Additionally, accurate predictions of monthly passenger count help stakeholders in the aviation industry, such as airlines and travel agencies, in their strategic decision-making. These predictions assist airlines in adjusting their flight frequencies, seat capacities, and pricing strategies to meet the demand. Travel agencies can better anticipate customer preferences and tailor their offerings accordingly.
+
+Furthermore, accurate predictions of passenger count contribute to transportation planning and policy development. Governments and regulatory bodies rely on such forecasts to assess the need for infrastructure expansions, evaluate environmental impacts, and enhance the overall transportation network efficiency. This information enables long-term planning and investment decisions in areas such as road networks, public transport systems, and airport expansions.
+
+Overall, developing a reliable regression model to predict monthly passenger count for a major international airport has far-reaching implications for operational efficiency, strategic decision-making, and transportation planning. It empowers stakeholders with crucial insights to optimize resources, enhance services, and facilitate sustainable growth in the aviation industry.
+
+Now that we've gotten a sense of why this project could potentially be useful, let's get into it.
+
+# Loading packages, setting up workspace
+
+```{r, message=FALSE}
+library(tidyverse)
+library(tidymodels)
+library(ggplot2)
+library(corrplot)
+library(ggthemes)
+library(kableExtra)
+library(gridExtra)
+library(kknn)
+library(yardstick)
+library(dplyr)
+library(themis)
+library(forcats)
+library(xgboost)
+library(naniar)
+library(vip)
+```
+
+# Loading in data & EDA
+
+```{r}
+pass_data <- read.csv('data/sfo.csv')
+head(pass_data)
+```
+
+## Dealing with missing data (lack of)
+
+Let's look at the dimensions of our raw data to see how many observations we're working with and quickly check if there are any missing values in our data. We'll use the library `naniar` to assess if there's any missing observations in the raw data, although it was said to be contain no missing values by the source.
+
+```{r}
+dim(pass_data)
+vis_miss(pass_data)
+```
+
+We can see that our data contains 50,730 observations and doesn't contain any missing data. We don't have to worry about handling missing data, imputation, etc... Phew! Oddly enough, it does seem like there are duplicate values in the data, just by looking at the first couple observations. Let's handle that in the next chunk by selecting unique values only.
+
+```{r}
+unique_data <- distinct(pass_data)
+dim(unique_data)
+```
+
+We can see that the shape of the data is a little over half the length of the original data. We've reduced our data by quite a bit. Since this project focuses specifically on predicting monthly passenger count for international flights, let's look at the shape of the data we're interested in by filtering the data by picking up international observations only. 
+
+```{r}
+intl_pass_data <- unique_data[(unique_data$GEO.Summary == 'International'),]
+dim(intl_pass_data)
+```
+
+Cool, so our data frame of interest contains 16,751 observations- this is more than half of the dataframe with unique values. We've already checked for missing data, and didn't find any. So far so good. Let's move on to exploring our response variable.
+
+## Response and outliers
+
+Let's look at the distribution of our target variable, `Passenger.Count`. 
+
+```{r}
+ggplot(intl_pass_data, aes(x = Passenger.Count)) + geom_boxplot(fill = 'pink', alpha = 0.8)
+```
+
+We're not out of the woods yet. There seem to be many outliers in the distribution of `Passenger.Count`. After visually inspecting the boxplot, we can see that there are many outliers in the data, let's get a sense of the total number of outliers in the data using the boxplot.stats() function in R. 
+
+```{r}
+intl_outliers <- boxplot.stats(intl_pass_data$Passenger.Count)$out
+length(intl_outliers) / dim(intl_pass_data)[1]   # percentage of data that are outliers
+min(intl_outliers)                               # min outlier
+max(intl_outliers)                               # max outlier
+length(intl_outliers)                            # length of outliers
+```
+
+Looking at the output of the chunk, about 5.8 percent of our data can be classified as outliers. The smallest outlier in the data is 23,596, and the largest is 107,607. Because we're measuring the monthly passenger counts for certain carriers, it's safe to assume that large values wouldn't necessarily be due to error. Because the outliers are only 5.8 percent of the data, or 975 observations, we could potentially remove them. Making a separate model for outliers would probably not make sense due to the small amount of observations and the intuitive justification of a major international airport handling large amounts of passengers monthly. Another alternative would be to include the outliers in the testing data only, so that the model wouldn't overfit to the outliers in the training data.
+
+Let's see if we can see some trends in the outliers by inspecting the data. 
+
+```{r, warning = FALSE}
+raw_outliers <- intl_pass_data[(intl_pass_data$Passenger.Count > min(intl_outliers)),]
+
+ggplot(raw_outliers, aes(x = Operating.Airline)) + 
+  geom_bar(fill = 'pink', alpha = 0.8) + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Looking at the data in the default format, it seems like most of the outliers occur when United Airlines. This would make sense intuitively because SFO is one of United Airline's main hubs which would explain the large monthly traffic brought in by United Airline observations in the data. Additionally, we can see that the United Airlines is represented twice within the variable `Operating.Airline`. We might want to consolidate it into one level. Since the two operating airlines with the biggest counts are both United Airlines, let's combine that level into one. 
+
+```{r, messages = FALSE, warning = FALSE}
+intl_pass_data$Operating.Airline <- as.factor(intl_pass_data$Operating.Airline)
+intl_pass_data$Operating.Airline <- fct_collapse(intl_pass_data$Operating.Airline, "United Airlines" = c("United Airlines", "United Airlines - Pre 07/01/2013"))
+intl_pass_data$Operating.Airline <- fct_collapse(intl_pass_data$Operating.Airline, "Delta" = c("Delta", "Northwest Airlines (became Delta)"))
+
+intl_pass_data <- intl_pass_data[(intl_pass_data$Operating.Airline != "Philippine Airline, Inc. (INACTIVE - DO NOT USE)"),]
+intl_pass_data <- intl_pass_data[(intl_pass_data$Operating.Airline != "Icelandair (Inactive)"),]
+
+length(levels(intl_pass_data$Operating.Airline))
+```
+
+So now we're working with one level for United Airlines. We'll do the same for Delta. We can also see that some of the levels are listed as inactive or do not use, let's filter the data so we don't have to use these observations. 
+
+## Univariate Analysis
+
+Because all the predictors to be used are categorical, constructing a correlation matrix wouldn't be particularly helpful in understanding our data. Instead, let's proceed with a univariate analysis to get a better sense of how our predictors are distributed, and to see if we can make some inferences about how the predictors would affect our response- monthly passenger count. 
+
+#### Operating Airline
+
+`Operating.Airline` - Let's explore the distribution of operating airlines recorded in this data set. 
+
+```{r}
+ggplot(intl_pass_data, aes(x = Operating.Airline)) + 
+  geom_bar(fill = 'pink', alpha = 0.8) + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+We can see that there are alot of different levels to this variable. As seen in the outlier analysis, we can see that there are a significantly larger amount of United Airlines (UAL) observations in the data. As discussed before, this would make sense as UAL uses SFO as one of their main hubs in the United States. With that being said, we still have the problem of dealing with a large amount of levels. Because there are so many airlines, one way to deal with this could be to use one-hot encoding for the airlines that are most present in the dataset. Another option, that could be more viable is to use the `forcats` package to modify the levels of this factor so that only a certain number of airlines that are the most prevalent would be their own levels, and the rest would be lumped into an Other category. 
+
+While we're looking at `Operating.Airline`, let's see what the data set would look like if we didn't include United Airlines because of how big of an impact it has on the data, we might want to consider making a separate model for this airline, as it's the main airline that uses SFO as a hub and passenger traffic patterns may be different. 
+
+```{r}
+dim(intl_pass_data[(intl_pass_data$Operating.Airline != 'United Airlines'),])
+dim(intl_pass_data)
+```
+
+We can see that we have approximately 3300 less observations if we take out United Airlines from the levels of the Operating Airline factor. Let's also look at the distribution of Operating.Airlines after removing United. We can see that the class looks a little more balanced, let's continue our univariate analysis looking at the data both with and without United Airlines. 
+
+```{r}
+ggplot(intl_pass_data[(intl_pass_data$Operating.Airline != 'United Airlines'),], aes(x = Operating.Airline)) + 
+  geom_bar(fill = 'pink', alpha = 0.8) + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+#### Geo Summary
+
+`GEO.Summary` - All of the observations are international, so we can get rid of this column. 
+
+```{r}
+intl_pass_data <- select(intl_pass_data, -c('GEO.Summary'))
+```
+
+#### Geo Region
+
+`GEO.Region` - Let's look at the distribution of the geographic region of the international flights into and out of SFO. We can see that Asia and Europe are the top two regions associated with passenger traffic at SFO. (Includes United Airlines)
+
+```{r}
+ggplot(intl_pass_data, aes(x = GEO.Region)) + 
+  geom_bar(fill = 'pink', alpha = 0.8) + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Let's now look at the distribution of geographic region of the international flights into and out of SFO from all carriers except United Airlines. The distribution looks very similar to that of the geographic regions serviced when we include United Airlines.
+
+```{r}
+ggplot(intl_pass_data[(intl_pass_data$Operating.Airline != 'United Airlines'),], aes(x = GEO.Region)) + 
+  geom_bar(fill = 'pink', alpha = 0.8) + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+In the end, we can see that the distribution of the `GEO.Region` variable looks about the same with and without United Airlines observations.
+
+#### Activity Type Code
+
+`Activity.Type.Code` - Looks like there's an even amount of Deplaned and Enplaned observations in this dataset. There are slightly more enplaned observations. Thru/Transit observations have the least amount of observations however. 
+
+```{r}
+ggplot(intl_pass_data, aes(x = Activity.Type.Code)) + 
+  geom_bar(fill = 'pink', alpha = 0.8) + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Let's look at the data without United Airlines observations.
+
+```{r}
+ggplot(intl_pass_data[(intl_pass_data$Operating.Airline != 'United Airlines'),], aes(x = Activity.Type.Code)) + 
+  geom_bar(fill = 'pink', alpha = 0.8) + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+We can see that if we don't include United Airlines, the number of deplaned observations is greater than the number of enplaned observations. This could suggest that there are more passengers leaving SFO when we include passengers serviced by United Airlines- which would make sense given that United Airline's hub is SFO. This could also suggest that there are more passengers arriving in SFO when we don't include United Airlines.  
+
+#### Price Category Code
+
+`Price.Category.Code` - This doesn't look particularly helpful, but we can see that the majority of international flights into/out of SFO are not ran by low fare carriers. United isn't considered a low fare carrier, so we'll not bother to check the variable's distribution without including United Airlines observations.
+
+```{r}
+ggplot(intl_pass_data, aes(x = Price.Category.Code)) + 
+  geom_bar(fill = 'pink', alpha = 0.8) + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+One thing that may help improve model performance and introduce low fare consideration into the model would be to create a dummy variable that would indicate whether or not an observation is from a low fare carrier. 
+
+#### Terminal
+
+`Terminal` - Most of the international flights are out of the international terminal, but there do seem to be some flights out of terminals 1, 2, and 3.
+
+```{r}
+ggplot(intl_pass_data, aes(x = Terminal)) + 
+  geom_bar(fill = 'pink', alpha = 0.8) + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+When we don't include United Airlines observations, the distribution of `Terminal` looks about the same. However, there are less observations from Terminal 3. 
+
+```{r}
+ggplot(intl_pass_data[(intl_pass_data$Operating.Airline != 'United Airlines'),], aes(x = Terminal)) + 
+  geom_bar(fill = 'pink', alpha = 0.8) + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+#### Boarding Area
+
+`Boarding.Area` - Looks like the majority of traffic from international flights at SFO are from boarding areas A and G, although the other areas do see passenger traffic as well. 
+
+```{r}
+ggplot(intl_pass_data, aes(x = Boarding.Area)) + 
+  geom_bar(fill = 'pink', alpha = 0.8) + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Once again, the distribution of `Boarding.Area` looks roughly the same when we don't include United Airlines observations. It does look like the number of observations with Boarding Area's F and G did go down however.
+
+```{r}
+ggplot(intl_pass_data[(intl_pass_data$Operating.Airline != 'United Airlines'),], aes(x = Boarding.Area)) + 
+  geom_bar(fill = 'pink', alpha = 0.8) + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+#### Operating Airline Code
+
+`Operating.Airline.IATA.Code` isn't explored, as it mirrors the `Operating.Airline` variable. 
+
+## Feature engineering
+
+Feature engineering plays a crucial role in developing a regression model for predicting monthly passenger counts especially when all the predictor variables are categorical. The quality and relevance of these new 'engineered' features can significantly impact the accuracy and effectiveness of the model. By transforming and creating new features based on the categorical variables, we can gain valuable information and capture meaningful patterns that might not be initially evident. Methods such as one-hot encoding can be applied to convert categorical variables into numerical representations that the regression model can understand. Overall, feature engineering acts as a necessary step in capturing the full predictive potential of categorical predictor variables, with the end goal being more reliable and insightful predictions of monthly passenger counts. 
+
+#### Quarter dummy variables
+
+Let's start off with `Activity.Period`. Since time series analysis of this data is out of the scope of this class, let's convert `Activity.Period` to dummy variables representing whether or not the observation falls into quarters 1 through 4 to use in the models. Hopefully the creation of these dummy variables will allow us to capture/ incorporate seasonal passenger counts trends into the model. First let's drop the year from the activity period. 
+
+```{r}
+# Convert Activity.Period to a character to get rid of the first 4 digits
+intl_pass_data$Activity.Period <- substr(intl_pass_data$Activity.Period, 5, nchar(intl_pass_data$Activity.Period))
+head(intl_pass_data$Activity.Period)
+```
+
+Next, we're creating the q1 through q4 variables. Great, looks like it worked, we have 4 new variables at the end of our dataframe. 
+
+```{r}
+intl_pass_data$q1 <- ifelse((as.integer(intl_pass_data$Activity.Period) >= 1 & (as.integer(intl_pass_data$Activity.Period) <= 3)), 1, 0)
+intl_pass_data$q2 <- ifelse((as.integer(intl_pass_data$Activity.Period) >= 4 & (as.integer(intl_pass_data$Activity.Period) <= 6)), 1, 0)
+intl_pass_data$q3 <- ifelse((as.integer(intl_pass_data$Activity.Period) >= 7 & (as.integer(intl_pass_data$Activity.Period) <= 9)), 1, 0)
+intl_pass_data$q4 <- ifelse((as.integer(intl_pass_data$Activity.Period) >= 10 & (as.integer(intl_pass_data$Activity.Period) <= 12)), 1, 0)
+head(intl_pass_data[,(c('q1', 'q2', 'q3', 'q4'))])
+```
+
+Let's look at the breakdown of our new quarter variables. Looking at the percentages of each quarter in the whole dataset in the chunk below, we can see that they all look equally represented in the data. 
+
+```{r}
+sum(intl_pass_data[,c('q1')]) / dim(intl_pass_data)[1]
+sum(intl_pass_data[,c('q2')]) / dim(intl_pass_data)[1]
+sum(intl_pass_data[,c('q3')]) / dim(intl_pass_data)[1]
+sum(intl_pass_data[,c('q4')]) / dim(intl_pass_data)[1]
+```
+
+#### Dont.match
+
+Next, let's create a feature called `dont.match`. Let's start off with using the `Operating.Airline.IATA.Code` and `Published.Airline.IATA.Code` variables to create the feature that will check if the operating airline and published airline differ, maybe this will be an important factor in determining passenger count. From the chunk below, we can see that there are 729 international flights where the published airline and the operating airline are not the same. Maybe this could affect passenger count. 
+
+```{r}
+intl_pass_data$dont.match <- ifelse((intl_pass_data$Operating.Airline.IATA.Code != intl_pass_data$Published.Airline.IATA.Code),intl_pass_data$dont.match <- 1, intl_pass_data$dont.match <- 0)
+sum(intl_pass_data$dont.match)
+```
+
+#### Dealing with Operating.Airline
+
+When we were conducting univariate analysis on the `Operating.Airline` variable, we saw that there were too many levels. One of the options discussed to deal with this issue was to use the forcats package to represent airlines with the highest counts in the data as individual levels, while lumping the less frequent levels together in an Other category. Intuitively, it makes sense to do as we're working with data from a major international airport- logically, some airlines will have a bigger effect on predicting response than others, especially if they occur more frequently. 
+
+Let's proceed by using the forcats package in R to lump the levels with the least counts into an other category, keeping a specified `n` number of existing levels. Below we try various different values of n.
+
+```{r}
+nlevels(intl_pass_data$Operating.Airline)
+```
+
+We can see that we're starting off with 77 levels, let's condense that. 
+
+```{r}
+intl_pass_data$operating_t5 <- fct_lump(intl_pass_data$Operating.Airline, n = 5, other_level = "Other")
+intl_pass_data$operating_t10 <- fct_lump(intl_pass_data$Operating.Airline, n = 10, other_level = "Other")
+intl_pass_data$operating_t15 <- fct_lump(intl_pass_data$Operating.Airline, n = 15, other_level = "Other")
+intl_pass_data$operating_t20 <- fct_lump(intl_pass_data$Operating.Airline, n = 20, other_level = "Other")
+intl_pass_data$operating_t25 <- fct_lump(intl_pass_data$Operating.Airline, n = 25, other_level = "Other")
+intl_pass_data$operating_t30 <- fct_lump(intl_pass_data$Operating.Airline, n = 30, other_level = "Other")
+intl_pass_data$operating_t40 <- fct_lump(intl_pass_data$Operating.Airline, n = 40, other_level = "Other")
+
+# Plot the level frequencies after lumping
+p1 <- ggplot(intl_pass_data, aes(x = operating_t5)) + 
+        geom_bar(fill = 'pink', alpha = 0.8) + 
+        theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p2 <- ggplot(intl_pass_data, aes(x = operating_t10)) + 
+        geom_bar(fill = 'pink', alpha = 0.8) + 
+        theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p6 <- ggplot(intl_pass_data, aes(x = operating_t30)) + 
+        geom_bar(fill = 'pink', alpha = 0.8) + 
+        theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+min(table(intl_pass_data$operating_t30))
+
+p1; p2; p6
+```
+
+From the barplots above, we can see that when n = 30, we're getting a factor where the Other level is not the level with the highest count. This could indicate that the other airlines are better represented in our model, giving it more flexibility. We can't say the same for the other values of n we chose. The count of observations in the Other level is significantly higher than any other level. With that being said, let's stick with n = 30, as it's the threshold around which the Other category becomes smaller than the most prevalent level (United)- hopefully this way we can include a greater selection of airlines in our model. We're using a little under half of the levels of the original variable `Operating.Airline`. 
+
+#### Low fare dummy variable
+
+As we saw in our univariate analysis, the variable `Price.Category.Code` is unbalanced. Rather than ignore this variable, one can presume that if an observation is labeled as low fare, it could potentially impact the response. To account for this, let's create a dummy variable for `Price.Category.Code` to indicate whether or not an observation is labelled as low fare. We do this in the following code chunk.
+
+```{r}
+intl_pass_data$is_low_fare <- ifelse((intl_pass_data$Price.Category.Code == "Low Fare"),intl_pass_data$is_low_fare <- 1, intl_pass_data$is_low_fare <- 0)
+intl_pass_data$is_low_fare <- as.factor(intl_pass_data$is_low_fare)
+head(intl_pass_data$is_low_fare)
+```
+
+#### Activity type dummy variable
+
+The `Activity.Type.Code` variable denotes if an observation is deplaned, enplaned, or thru/transit. Because the response (passenger counts) depends on whether or not the observation was deplaned or enplaned, we'll create a dummy variable for `Activity.Type.Code` to indicate if a plane is arriving "Deplaned" or not. In the following chunk, we're also converting the lumped operating airline factors we created earlier into factors for our model. 
+
+```{r}
+intl_pass_data$is_deplaned <- ifelse((intl_pass_data$Activity.Type.Code == "Deplaned"),intl_pass_data$is_deplaned <- 1, intl_pass_data$is_deplaned <- 0)
+intl_pass_data$is_deplaned <- as.factor(intl_pass_data$is_deplaned)
+
+intl_pass_data$GEO.Region <- as.factor(intl_pass_data$GEO.Region)
+intl_pass_data$Terminal <- as.factor(intl_pass_data$Terminal)
+intl_pass_data$Boarding.Area <- as.factor(intl_pass_data$Boarding.Area)
+intl_pass_data$operating_t30 <- as.factor(intl_pass_data$operating_t30)
+```
+
+#### Converting factors
+
+In a regression model, including categorical variables as factors is important because it allows us to capture the relationship between these variables and the continuous outcome variable (passenger counts). As we've seen from our EDA, categorical variables represent non-numeric characteristics, such as operating airline, terminal, or geographic region. By treating them as factors in regression, we can model the impact of the levels of each variable on the predicted outcome. This enables us to quantify the effect of each category. Without treating categorical variables as factors, we would lose valuable information and potentially misrepresent the relationship between these variables and the outcome. Therefore, incorporating categorical variables as factors is crucial in regression modeling to accurately understand and interpret the influence of the levels of categorical predictor variables on the continuous response variable (passenger counts).
+
+Because we're going to be coding the categorical factors into factors with integers as levels, let's create a makeshift "codebook" so we're able to identify the levels of certain factors after they've been converted to integers for the models to use.
+
+1) `GEO.Region`
+
+```{r}
+levels(intl_pass_data$GEO.Region)
+```
+
+2) `Termninal`
+
+```{r}
+levels(intl_pass_data$Terminal)
+```
+
+3) `Boarding.Area`
+
+```{r}
+levels(intl_pass_data$Boarding.Area)
+```
+
+4) `operating_t30`
+
+```{r}
+levels(intl_pass_data$operating_t30)
+```
+
+Here, we convert characters into factors with levels that are integers
+
+```{r}
+intl_pass_data <- intl_pass_data %>%
+  mutate_if(is.character, forcats::fct_inorder)
+
+intl_pass_data$dont.match <- as.factor(intl_pass_data$dont.match)
+
+intl_pass_data$q1 <- as.factor(intl_pass_data$q1)
+intl_pass_data$q2 <- as.factor(intl_pass_data$q2)
+intl_pass_data$q3 <- as.factor(intl_pass_data$q3)
+intl_pass_data$q4 <- as.factor(intl_pass_data$q4)
+
+intl_pass_data$GEO.Region <- as.factor(as.integer(intl_pass_data$GEO.Region))
+intl_pass_data$Terminal <- as.factor(as.integer(intl_pass_data$Terminal))
+intl_pass_data$Boarding.Area <- as.factor(as.integer(intl_pass_data$Boarding.Area))
+intl_pass_data$operating_t30 <- as.factor(as.integer(intl_pass_data$operating_t30))
+```
+
+# Pre model building considerations
+
+We're almost ready to start fitting models to the data, but we need to take care of splitting our data, creating a recipe for the models, and utilizing k-fold cross-validation.
+
+## Addressing stratified sampling
+
+Since we're building a regression model, we don't need to stratify on the outcome variable. Stratified sampling ensures that an imbalanced outcome class, typically for a classification problem, is well represented throughout model assessment in the training folds. Since our response variable is continious, we'll just utilize random sampling from our k-fold cross validation.
+
+## Splitting the data 
+
+Splitting the data into a training and testing set is essential for the creation of a regression model because it allows us to assess the model's performance on unseen data. The training set is used to fit the regression model, enabling it to learn patterns and relationships within the data- the majority of the raw data will be training data. By training the model on a large range of examples, it can capture the underlying trends and make accurate predictions. However, evaluating the model solely on the training data can lead to overfitting, where the model becomes overly tuned to the training set and fails to predict new data well- a characteristic of an overfit model is having low bias and high variance. To address this, we reserve a portion of the data as the testing set, which the model has not seen during training. The testing set serves as an independent evaluation dataset to assess the model's performance on unseen observations. By evaluating the model on this separate dataset, we can obtain a more unbiased estimate of how well the model will perform in the real world. This split helps us gauge the model's ability to generalize and provides valuable insights into its predictive power, allowing us to fine-tune and improve the regression model as needed. Since we have a relatively large dataset, we'll use a standard 80/20 split for our training and testing set. 
+
+```{r}
+# Splitting the data
+pax_split <- initial_split(intl_pass_data, prop = 0.80)
+pax_train <- training(pax_split)
+pax_test <- testing(pax_split)
+```
+
+## Recipe creation
+
+Here we'll create the recipe that each of our models will use to predict the response (passenger counts). We'll be working with the variables we've seen initially through the EDA, as well as the variables we created in the feature engineering section. Of course we're predicting `Passenger.Count`. We'll specify the predictor variables we'll be using: `GEO.Region`, `Terminal`, `Boarding.Area`, `operating_t30`, `q1`, `q2`, `q3`, `q4`, `dont.match`, `is_low_fare`, `is_deplaned`. In all, we're using 11 predictors in our recipe to predict our outcome `Passenger.Count`. 
+
+```{r}
+pax_recipe <- recipe(Passenger.Count ~ GEO.Region + Terminal + Boarding.Area + operating_t30 + q1 + q2 + q3 + q4 + dont.match + is_low_fare + is_deplaned, data = pax_train) %>%
+  step_integer(all_of(c('GEO.Region', 'Terminal', 'Boarding.Area', 'operating_t30', 'q1', 'q2', 'q3', 'q4', 'dont.match', 'is_low_fare', 'is_deplaned')))
+  
+pax_recipe
+prep(pax_recipe) %>% bake(pax_train)
+```
+
+## Cross-fold validation
+
+Incorporating cross-fold validation into our model assessment is also a crucial aspect of the model setup. In addition to the training and testing split, cross-fold validation offers further validation of the model's performance. Cross-fold validation involves dividing the training data into multiple subsets or folds, training and evaluating the model on different combinations of these folds. This technique provides a more robust assessment by averaging the performance across multiple assessment sets, ensuring that the model's performance is not dependent on a specific training-test split. Cross-fold validation provides a more reliable (less variable) estimate of the model's predictive performance.
+
+In this project, we'll use k = 5 folds. This means that we're taking the training data and assigning each observation in the training data to 1 of 5 folds. In each fold, a testing (assessment) set is created consisting of that fold and the remaining k-1 folds will be the training set for that fold. At the end, we end up with k total folds, and k estimates of testing error which will be averaged to obtain a final testing error- this process reduces variability in our estimate for testing error. 
+
+```{r}
+# 5 fold cross validation object
+folds <- vfold_cv(pax_test, v = 5)
+```
+
+# Model building
+
+Now that we've split our data, discussed how we'll incorporate k-fold cross validation into our model, and set up our recipe, we're ready to start building our different models. We'll use our recipe to fit 6 different regression models: a simple linear regression, a knn model, 2 types of regularized regression models (ridge regression & lasso regression), and 2 ensemble-based tree models(random forest model & a boosted tree model). We'll evaluate the performance of the models based on RMSE (root mean squared error). We'll then fit the best two performing models to the testing data and see which one performs the best. 
+
+## Fitting the models
+
+Fitting each of the models listed above involves the same steps, with small deviations for those models whose hyperparameters we'll have to tune. 
+
+1) We'll first initialize an object of each model to use in their respective workflows. We'll specify hyperparameters that need tuning, and we'll specify the mode of some of the models that can be used for either regression or classification tasks as well. 
+
+```{r}
+# initialize linear regression model object 
+lm_model <- linear_reg() %>% 
+  set_engine("lm")
+
+# initialize knn regression model object
+knn_model <- nearest_neighbor(neighbors = tune()) %>% set_engine("kknn") %>% 
+  set_mode('regression')
+
+# initialize ridge regression model object
+ridge_model <- linear_reg(penalty = tune(), mixture = 0) %>% 
+  set_mode("regression") %>% 
+  set_engine("glmnet")
+
+# initialize lasso regression model object
+lasso_model <- linear_reg(penalty = tune(), mixture = 1) %>% 
+  set_mode("regression") %>% 
+  set_engine("glmnet")
+
+# initialize random forest model object
+rf_model <- rand_forest(mtry = tune(), trees = tune(), min_n = tune()) %>% 
+  set_engine("ranger", importance = "impurity") %>% 
+  set_mode("regression")
+
+# initialize boosted tree model object
+boosted_model <- boost_tree(trees = tune(), learn_rate = tune(), min_n = tune()) %>%
+  set_engine("xgboost") %>%
+  set_mode("regression")
+```
+
+2) Next, we'll set up the workflows for each model, providing the specified model object, and the recipe we created in the previous section. The workflow is needed when we tune our models and use cross-fold validation to get an estimate of test error in order to evaluate the performance accross all models.
+
+```{r}
+# linear regression model workflow
+lm_wflow <- workflow() %>% 
+  add_model(lm_model) %>%
+  add_recipe(pax_recipe)
+
+# knn regression model workflow
+knn_wflow <- workflow() %>%
+  add_model(knn_model) %>%
+  add_recipe(pax_recipe)
+
+# ridge regression model workflow
+ridge_wflow <- workflow() %>%
+  add_model(ridge_model) %>% 
+  add_recipe(pax_recipe)
+
+# lasso regression model workflow
+lasso_wflow <- workflow() %>% 
+  add_model(lasso_model) %>% 
+  add_recipe(pax_recipe)
+
+# random forest model workflow
+rf_wflow <- workflow() %>% 
+  add_model(rf_model) %>% 
+  add_recipe(pax_recipe)
+
+# boosted tree model workflow
+boosted_wflow <- workflow() %>% 
+  add_model(boosted_model) %>% 
+  add_recipe(pax_recipe)
+```
+
+3) After we've initialized our model objects to pass into each model's respective workflow, we'll need to make tuning grids for each model that requires hyperparameter tuning. The goal of hyperparameter tuning is to achieve a balance between model complexity and generalization. We want to find the hyperparameter values that result in a model that performs well on unseen (test) data and can generalize to new observations. We don't need a grid for our linear regression since there aren't any hyperparameters associated with the model. 
+
+```{r}
+# knn grid 
+knn_grid <- grid_regular(neighbors(range = c(1,10)), levels = 10)
+
+# ridge grid
+ridge_grid <- grid_regular(penalty(range = c(0,1)), levels = 10)
+
+# lasso grid - we'll use ridge_grid, as the same hyperparameter is being tuned
+
+# random forest grid
+rf_grid <- grid_regular(mtry(range = c(1, 11)), trees(range = c(50, 200)), 
+                        min_n(range = c(5, 20)), levels = 8)
+
+# boosted tree grid
+boosted_grid <- grid_regular(trees(range = c(50, 200)), learn_rate(range = c(0.01,0.1), 
+                             trans = identity_trans()), min_n(range = c(40, 60)), levels = 8)
+```
+
+Before moving on, it's important to note that the choice of the range of hyperparameters to choose in this step is subjective. Most of the ranges and values for levels chosen are due to consideration of computational efficiency. Hyperparameters such as `mtry` in the random forest grid need to be between a certain range of values ([1,11] in this case) due to constraints on the number of predictors available. 
+
+4)  After having initialized our model objects, created our models respective workflows, created our tuning grids for each models hyperparameters (save the linear regression model), we're ready to tune our models according to the hyperparameter grids we created in the previous step. Using the `tune_grid` function for models with hyperparameters to tune and `fit_resamples` to our linear regression model, we'll iteratively fit many models with different combinations of hyperparameter values specified in the grids above to our training data. In addition to the combinations of hyperparameters specified by the grids, k-fold cross validation will also increase the amount of models fitted to get a better estimate of training error- which we'll use to evaluate model performance and eventually select our top two models. Let's do it!
+
+```{r, eval = FALSE, message = FALSE}
+# linear regression model - since this model doesn't have hyperparameters, we can use the function fit_resamples to fit different models according to the different folds
+lm_fit_val <- fit_resamples(lm_wflow, resamples = folds)
+
+# knn regression model 
+knn_tune <- tune_grid(
+  knn_wflow,
+  resamples = folds,
+  grid = knn_grid
+)
+
+# ridge regression model
+ridge_tune <- tune_grid(
+  ridge_wflow,
+  resamples = folds,
+  grid = ridge_grid
+)
+
+# lasso regression model - we'll use ridge_grid here, as we're tuning the same hyperparameter (only thing that's different is the mixture hyperparameter (0 vs. 1))
+lasso_tune <- tune_grid(
+  lasso_wflow,
+  resamples = folds,
+  grid = ridge_grid
+)
+
+# random forest model 
+rf_tune <- tune_grid(
+  rf_wflow, 
+  resamples = folds, 
+  grid = rf_grid
+  )
+
+# boosted tree model
+boosted_tune <- tune_grid(
+  boosted_wflow, 
+  resamples = folds, 
+  grid = boosted_grid
+  )
+```
+
+5) After running the `tune_grid` and `fit_resamples` functions, we're saving our models into rds files so we avoid tuning the models again. 
+
+```{r, eval = FALSE}
+write_rds(lm_fit_val, file = 'models/lm_fit_val.rds')
+write_rds(knn_tune, file = 'models/knn_tune.rds')
+write_rds(ridge_tune, file = 'models/ridge_tune.rds')
+write_rds(lasso_tune, file = 'models/lasso_tune.rds')
+write_rds(rf_tune, file = 'models/rf_tune.rds')
+write_rds(boosted_tune, file = 'models/boosted_tune.rds')
+```
+
+6) Here, we're loading them back into our workspace.
+
+```{r}
+lm_fit_val <- read_rds('models/lm_fit_val.rds')
+knn_tune <- read_rds('models/knn_tune.rds')
+ridge_tune <- read_rds('models/ridge_tune.rds')
+lasso_tune <- read_rds('models/lasso_tune.rds')
+rf_tune <- read_rds('models/rf_tune.rds')
+boosted_tune <- read_rds('models/boosted_tune.rds')
+```
+
+7) After tuning all the models on all possible hyperparameter combinations across all folds, we'll collect the rmse metrics from each model in order to assess model performance, and to see which two we'll move forward with to evaluate on our test data. 
+
+```{r}
+# linear regression model rmse
+lm_rmse <- as.double(arrange(filter(collect_metrics(lm_fit_val), .metric == 'rmse'), mean)[1,3])
+
+# knn regression model rmse
+knn_rmse <- as.double(arrange(filter(collect_metrics(knn_tune), .metric == 'rmse'), mean)[1,4])
+
+# ridge regression model rmse
+ridge_rmse <- as.double(arrange(filter(collect_metrics(ridge_tune), .metric == 'rmse'), mean)[1,4])
+
+# lasso regression model rmse
+lasso_rmse <- as.double(arrange(filter(collect_metrics(lasso_tune), .metric == 'rmse'), mean)[1,4])
+
+# random forest model rmse
+rf_rmse <- as.double(arrange(filter(collect_metrics(rf_tune), .metric == 'rmse'), mean)[1,6])
+
+# boosted tree model rmse
+boosted_rmse <- as.double(arrange(filter(collect_metrics(boosted_tune), .metric == 'rmse'), mean)[1,6])
+```
+
+# Model results
+
+We've done the hard work, and we're almost finished. Let's see which model performed the best on the training data.
+
+```{r}
+compare_df <- data.frame(model = c('linear regression', 'knn regression', 'ridge regression', 'lasso regression', 'random forest model', 'boosted tree model'),
+                         rmse = c(lm_rmse, knn_rmse, ridge_rmse, lasso_rmse, rf_rmse, boosted_rmse))
+
+compare_df
+
+ggplot(compare_df, aes(x = model, y = rmse)) + 
+  geom_bar(stat = 'identity', fill = 'pink', alpha = 0.8) + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+From the output of the above chunk, we can see that the three best models were the knn regression model, random forest model, and the boosted tree model. The best performing model was the random forest model with an RMSE of 6940.089. Something to consider is that the linear regression, and both types of regularized regression performed the worst- potentially indicating that the relationship is probably non-linear. 
+
+## Autoplots of best models
+
+### Random forest model
+
+```{r, message = FALSE, warning = FALSE}
+autoplot(rf_tune, metric = 'rmse')
+select_best(rf_tune)
+```
+
+The random forest model was our best performing model when it comes to RMSE. From the autoplot, we can see that tree size didn't matter, as each level of tree size seems to be overlapped. Upon visual inspection, it also doesn't seem like minimal node size had a significant effect on RMSE, however the rate of change of RMSE does seem to change a little bit for different minimal node sizes. Lastly, the number of randomly selected predictors (mtry) seems to have the largest effect on RMSE. We can see that on across all minimal node sizes and # of trees, that RMSE seems to decrease quickly until an mtry value of around 6. Our best random forest model used an mtry of 9, trees value of 50, and min_n of 15. 
+
+### Boosted tree model
+
+```{r, message = FALSE, warning = FALSE}
+autoplot(boosted_tune, metric = 'rmse')
+```
+
+The boosted tree models were the second best performing models on our data. Unlike the random forest model, the number of trees does seem to have an affect on the RMSE. As the number of trees increases, the RMSE tends to decrease. As the learning rate increases, the RMSE decreases as well. For larger learning rates, the RMSE tends to be lower. across all other hyperparameters. Interestingly, the mininal node size doesn't seem to have an effect on the RMSE of boosted tree models, as the lines seem to be stacked on top of each other for all values of the minimal node size. 
+
+# Fitting to testing set
+
+## Fitting model to training data
+
+Now that we've identified which models performed the best, we'll go ahead and fit our best random forest model to our training data and fit that model to our testing set to evaluate its performance. As mentioned before, our best random forest model uses an mtry of 9, trees value of 50, and min_n of 15. Let's fit that model to our training data and prep it for the final fitting onto our test set. We'll save it at the end of the chunk.
+
+```{r, eval = FALSE}
+# Fitting to the training data
+best_rf_train <- select_best(rf_tune, metric = 'rmse')
+
+rf_final_wflow_train <- finalize_workflow(rf_wflow, best_rf_train)
+rf_final_fit_train <- fit(rf_final_wflow_train, data = pax_train)
+
+write_rds(rf_final_fit_train, file = 'models/best_rf_train.rds')
+```
+
+Loading the model back in. 
+
+```{r}
+rf_final_fit_train <- read_rds('models/best_rf_train.rds')
+```
+
+## Testing the model
+
+Now we have the final model we're going to use on our testing set. Let's check the testing RMSE and compare it with the best RMSE from the training set. 
+
+```{r}
+# creating a tibble with the actual and predicted value
+pax_tibble <- predict(rf_final_fit_train, new_data = pax_test)
+truth <- pax_test$Passenger.Count
+pax_tibble <- cbind(truth, pax_tibble)
+
+# checking rmse of the model on testing data
+test_metric <- metric_set(rmse)
+pax_test_metrics <- test_metric(pax_tibble, truth = truth, estimate = .pred)
+pax_test_metrics
+```
+
+After fitting our trained model to our testing set, we get an RMSE of 6933.792. **I was having trouble setting the seed such that the RMSE estimate in Rstudio is the same estimate as on the knitted html file, Dr. Coburn said this was fine as long as I mention what was happening.** At the time of running the above chunk, the test RMSE is lower than the RMSE from the training data and cross-fold validation. Putting this RMSE into perspective, the mean of the testing data is 10173, and the median is 7374. Hence, our RMSE isn't amazing, but it is lower than the testing RMSE. We'll go over potential sources of this high RMSE in the conclusion section. 
+
+## Variable importance
+
+Because our best performing model was a random forest model, let's check out the variable importance plot. 
+ 
+```{r}
+rf_final_fit_train %>% 
+  extract_fit_engine() %>% 
+  vip(aesthetics = list(fill = "pink", color = "black"))
+```
+
+From this plot, we can see that the two variables that had the most significant impact on determining the response were `GEO.Region` and `operating_t30`. One of which is an 'engineered' variable. This would make intuitive sense as certain regions appear to bring in a larger amount of passengers than others. The second most important variable `operating_t30`'s effect on the response would be correlated to that of `GEO.Region`, as intuitively, airlines have specific geographic regions which they service. 
+
+# Conclusion
+
+In the end, after analyzing multiple models and their performance on predicting `Passenger.Counts`, the models that did the best jobs were non-parametric. The model that performed the best was the random forest model with hyper parameters being an `mtry` of 9, `trees` value of 50, and a `min_n` of 15. Because we didn't know the nature of the relationship of our data coming into this project, this makes sense. After all, non-parametric regression models often work better than parametric models in situations where the relationship between the predictors and the response is nonlinear, unknown, etc. Conversely, the models that performed the worst in predicting `Passenger.Counts` were parametric. The linear regression and two forms of regularized regression models (lasso and ridge models) has the highest RMSE among all of the models. 
+
+Even though the random forest model performed the best with an RMSE of 6933.792 on the testing set, as mentioned before, the mean of the testing data is 10173, and the median is 7374. This would indicate that even though it was the best performing, the model still didn't do too well in predicting `Passenger.Counts`. I suspect, as discussed in the very beginning of the project, some potential sources of this large error could include how we chose to deal with outliers in the response. As seen in the EDA section, roughly 5.8 percent of the data were outliers, and the majority of the outliers were observations corresponding to United Airlines. Because these outliers had such a big range, it would make sense that the model would be affected significantly. Intuitively, United Airlines uses SFO as a hub, so passenger traffic patterns would potentially be different for this specific airline. Another factor that could have affected the performance of these regression models was the lack of numeric (continuous) predictor variables. Unfortunately, the data provided lacked any quantifiable features (potentially such as cargo weight, arrival/departure frequency, time spent at gates, etc...) that could possibly have made the model better at predicting `Passenger.Counts`. Lastly, alot of the predictor variable classes were imbalanced, which could have caused a larger error by making the model too generalized. Going into the project however, the nature of the relationship between the predictor variables was unknown, so even though I have suspected causes of this large RMSE, perhaps the relationship between these predictors and the response is too complex to be modeled by anything I've tried above.
+
+If I were to continue this project, the first thing I would do is set a threshold based on outlier values and create separate models for each threshold. In the same vein, perhaps United Airlines passengers would exhibit different behaviors as their volume is much larger than other carriers. For this case, rather than creating a threshold, a separate model for United Airlines passenger traffic behavior could be a viable option in creating a better performing model. Another interesting avenue to take this project if I were to continue with it would be to conduct some time series analysis and look into modelling suspected seasonal patterns, and analyzing the volatility of `Passenger.Counts` over time. The original dataset included a date variable that would have been helpful in conducting the proposed time series analysis. 
+
+
+
+
+
+
